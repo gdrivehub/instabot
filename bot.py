@@ -29,6 +29,15 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 HEALTH_PORT = int(os.getenv("PORT", "8000"))
 IG_COOKIES_FILE = os.getenv("IG_COOKIES_FILE", "")
 
+# Write cookies from env var to disk at startup
+_IG_COOKIES_CONTENT = os.getenv("IG_COOKIES_CONTENT", "")
+if _IG_COOKIES_CONTENT and not IG_COOKIES_FILE:
+    _cookie_path = "/tmp/cookies.txt"
+    with open(_cookie_path, "w") as _f:
+        _f.write(_IG_COOKIES_CONTENT)
+    IG_COOKIES_FILE = _cookie_path
+    logger.info("Cookies written to %s", _cookie_path)
+
 # ── Instagram URL helpers ──────────────────────────────────────────────────
 INSTAGRAM_URL_RE = re.compile(
     r"https?://(?:www\.)?instagram\.com/"
