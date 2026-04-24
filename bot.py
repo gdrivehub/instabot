@@ -1,5 +1,7 @@
 import os
 import re
+import time
+import random
 import logging
 import asyncio
 import tempfile
@@ -29,7 +31,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 HEALTH_PORT = int(os.getenv("PORT", "8000"))
 IG_COOKIES_FILE = os.getenv("IG_COOKIES_FILE", "")
 
-# Write cookies from env var to disk at startup
+# Write cookies from env var to disk at startup (for Koyeb)
 _IG_COOKIES_CONTENT = os.getenv("IG_COOKIES_CONTENT", "")
 if _IG_COOKIES_CONTENT and not IG_COOKIES_FILE:
     _cookie_path = "/tmp/cookies.txt"
@@ -37,6 +39,15 @@ if _IG_COOKIES_CONTENT and not IG_COOKIES_FILE:
         _f.write(_IG_COOKIES_CONTENT)
     IG_COOKIES_FILE = _cookie_path
     logger.info("Cookies written to %s", _cookie_path)
+
+# ── Rate-limit state ───────────────────────────────────────────────────────
+# Track the last download time to enforce a minimum gap between requests
+_last_download_time: float = 0.0
+_download_lock = asyncio.Lock()
+
+# Minimum seconds to wait between downloads (randomised to look human)
+MIN_DELAY = float(os.getenv("MIN_DELAY", "4"))
+MAX_DELAY = float(os.getenv("MAX_DELAY", "8"))
 
 # ── Instagram URL helpers ──────────────────────────────────────────────────
 INSTAGRAM_URL_RE = re.compile(
@@ -55,7 +66,17 @@ def extract_url(text: str) -> str:
     return m.group(0) if m else ""
 
 
-# ── yt-dlp download ────────────────────────────────────────────────────────
+# ── yt-dlp options ─────────────────────────────────────────────────────────
+
+# Rotate through realistic User-Agents
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+]
+
 
 def _build_ydl_opts(tmpdir: str) -> dict:
     opts = {
@@ -68,36 +89,41 @@ def _build_ydl_opts(tmpdir: str) -> dict:
         "writethumbnail": False,
         "writeinfojson": False,
         "noplaylist": False,
+        # Retry settings
+        "retries": 3,
+        "fragment_retries": 3,
+        "retry_sleep_functions": {"http": lambda n: 2 ** n},
+        # Socket / connection settings
+        "socket_timeout": 30,
         "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": random.choice(_USER_AGENTS),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Sec-Fetch-Mode": "navigate",
         },
     }
     if IG_COOKIES_FILE and os.path.isfile(IG_COOKIES_FILE):
         opts["cookiefile"] = IG_COOKIES_FILE
-        logger.info("Using Instagram cookies from %s", IG_COOKIES_FILE)
+        logger.info("Using cookies from %s", IG_COOKIES_FILE)
+    else:
+        logger.warning("No cookies file found — anonymous access (high rate-limit risk)")
     return opts
 
 
 def _download_sync(url: str, tmpdir: str) -> tuple[list[Path], str]:
-    """Blocking download — called via asyncio.to_thread."""
+    """Blocking yt-dlp download. Run via asyncio.to_thread."""
     with yt_dlp.YoutubeDL(_build_ydl_opts(tmpdir)) as ydl:
         info = ydl.extract_info(url, download=True)
 
     if info is None:
         raise RuntimeError("yt-dlp returned no info for this URL.")
 
-    # Grab caption
     caption = ""
     for entry in (info.get("entries") or [info]):
         if entry and entry.get("description"):
             caption = entry["description"].strip()
             break
 
-    # Fallback: .description files
     if not caption:
         for desc_file in sorted(Path(tmpdir).glob("*.description")):
             text = desc_file.read_text(encoding="utf-8", errors="ignore").strip()
@@ -114,7 +140,24 @@ def _download_sync(url: str, tmpdir: str) -> tuple[list[Path], str]:
 
 
 async def download_instagram(url: str, tmpdir: str) -> tuple[list[Path], str]:
-    return await asyncio.to_thread(_download_sync, url, tmpdir)
+    """
+    Download with a per-process lock and a human-like delay between requests
+    to avoid Instagram rate-limiting.
+    """
+    global _last_download_time
+
+    async with _download_lock:
+        # Enforce minimum gap since last download
+        elapsed = time.monotonic() - _last_download_time
+        delay = random.uniform(MIN_DELAY, MAX_DELAY)
+        wait = max(0.0, delay - elapsed)
+        if wait > 0:
+            logger.info("Waiting %.1fs before download (rate-limit protection)", wait)
+            await asyncio.sleep(wait)
+
+        result = await asyncio.to_thread(_download_sync, url, tmpdir)
+        _last_download_time = time.monotonic()
+        return result
 
 
 # ── Caption helper ─────────────────────────────────────────────────────────
@@ -190,7 +233,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     url = extract_url(text)
-    status = await update.message.reply_text("⏳ Downloading… please wait.")
+
+    # Tell user if they'll need to wait due to rate-limit delay
+    elapsed = time.monotonic() - _last_download_time
+    wait_est = max(0.0, MIN_DELAY - elapsed)
+    if wait_est > 1:
+        status = await update.message.reply_text(
+            f"⏳ Downloading… (brief delay to avoid Instagram rate-limits, ~{int(wait_est)+1}s)"
+        )
+    else:
+        status = await update.message.reply_text("⏳ Downloading… please wait.")
 
     tmpdir = tempfile.mkdtemp(prefix="instabot_")
     try:
@@ -201,10 +253,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except yt_dlp.utils.ExtractorError as exc:
         msg = str(exc)
         logger.error("ExtractorError for %s: %s", url, msg)
-        if "login" in msg.lower() or "private" in msg.lower():
+        if "login" in msg.lower() or "private" in msg.lower() or "rate" in msg.lower():
             await status.edit_text(
-                "🔒 This content is private or requires login.\n"
-                "Ask the bot admin to configure Instagram cookies."
+                "🔒 Instagram blocked this request.\n\n"
+                "This usually means:\n"
+                "• Your cookies have expired — re-export and update <code>IG_COOKIES_CONTENT</code>\n"
+                "• The post is private\n"
+                "• Instagram is temporarily blocking this server's IP\n\n"
+                "Try again in a few minutes.",
+                parse_mode="HTML",
             )
         else:
             await status.edit_text(
@@ -212,11 +269,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
 
     except yt_dlp.utils.DownloadError as exc:
-        logger.error("DownloadError for %s: %s", url, exc)
-        await status.edit_text(
-            "❌ Download failed. Instagram may be rate-limiting. "
-            "Please try again in a few minutes."
-        )
+        msg = str(exc)
+        logger.error("DownloadError for %s: %s", url, msg)
+        if "rate" in msg.lower() or "login" in msg.lower() or "not available" in msg.lower():
+            await status.edit_text(
+                "⚠️ <b>Instagram rate-limit hit.</b>\n\n"
+                "Your cookies may have expired. To fix:\n"
+                "1. Export fresh cookies from your browser\n"
+                "2. Update <code>IG_COOKIES_CONTENT</code> in Koyeb env vars\n"
+                "3. Redeploy\n\n"
+                "Or just wait a few minutes and try again.",
+                parse_mode="HTML",
+            )
+        else:
+            await status.edit_text(
+                "❌ Download failed. Please try again in a few minutes."
+            )
 
     except Exception:
         logger.exception("Unexpected error for URL %s", url)
@@ -226,13 +294,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ── Async health-check server (aiohttp, same event loop as the bot) ────────
+# ── Async health-check server ──────────────────────────────────────────────
 
 async def _health(_request: web.Request) -> web.Response:
     return web.Response(text="OK")
 
 
-async def _start_health_server():
+async def _start_health_server() -> None:
     app = web.Application()
     app.router.add_get("/", _health)
     app.router.add_get("/health", _health)
@@ -240,7 +308,7 @@ async def _start_health_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", HEALTH_PORT)
     await site.start()
-    logger.info("Health-check server listening on port %s", HEALTH_PORT)
+    logger.info("Health-check server on port %s", HEALTH_PORT)
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -250,8 +318,6 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Start the health-check server inside the bot's own event loop
-    # post_init runs after the event loop is started but before polling begins
     async def post_init(application: Application) -> None:
         await _start_health_server()
 
