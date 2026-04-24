@@ -1,0 +1,27 @@
+# koyeb.yaml — declarative deployment for Koyeb
+# Push this repo to GitHub, then import it in Koyeb.
+# Set the environment variables in the Koyeb dashboard (never commit secrets).
+
+app: instabot
+
+services:
+  - name: telegram-bot
+    type: worker           # Long-running process, no HTTP port needed
+    git:
+      repository: github.com/<YOUR_GITHUB_USERNAME>/<YOUR_REPO_NAME>
+      branch: main
+      build_type: dockerfile
+      dockerfile: Dockerfile
+    instance_type: nano    # Cheapest tier — plenty for a Telegram bot
+    regions:
+      - fra                # Frankfurt; change to was (Washington) if preferred
+    env:
+      - key: BOT_TOKEN
+        value: ""          # ← Set this as a SECRET in the Koyeb dashboard
+      - key: IG_USERNAME
+        value: ""          # Optional Instagram username
+      - key: IG_PASSWORD
+        value: ""          # Optional Instagram password (set as SECRET)
+    scaling:
+      min: 1
+      max: 1
