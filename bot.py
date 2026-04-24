@@ -4,6 +4,8 @@ import logging
 import asyncio
 import tempfile
 import shutil
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 from telegram import Update, InputMediaPhoto, InputMediaVideo
@@ -15,7 +17,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram.constants import ParseMode
-import instaloader
+import yt_dlp
 
 # ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -26,249 +28,224 @@ logger = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+HEALTH_PORT = int(os.getenv("PORT", "8000"))
 
-# Optional: provide Instagram credentials to access private content / avoid
-# rate-limits.  Leave blank to use anonymous access.
-IG_USERNAME = os.getenv("IG_USERNAME", "")
-IG_PASSWORD = os.getenv("IG_PASSWORD", "")
+# Optional: path to a Netscape-format cookies file exported from your browser
+# while logged in to Instagram. Set IG_COOKIES_FILE env var on Koyeb.
+IG_COOKIES_FILE = os.getenv("IG_COOKIES_FILE", "")
 
-# ── Instaloader setup ──────────────────────────────────────────────────────
-L = instaloader.Instaloader(
-    download_videos=True,
-    download_video_thumbnails=False,
-    download_geotags=False,
-    download_comments=False,
-    save_metadata=False,
-    compress_json=False,
-    post_metadata_txt_pattern="",   # don't write caption files
-    filename_pattern="{shortcode}_{typename}",
-    quiet=True,
-)
+# ── Tiny HTTP health-check server (Koyeb requires this) ───────────────────
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
 
-if IG_USERNAME and IG_PASSWORD:
-    try:
-        L.login(IG_USERNAME, IG_PASSWORD)
-        logger.info("Logged in to Instagram as %s", IG_USERNAME)
-    except Exception as exc:
-        logger.warning("Instagram login failed: %s", exc)
+    def log_message(self, *_):
+        pass  # suppress access log spam
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
 
+def _start_health_server():
+    server = HTTPServer(("0.0.0.0", HEALTH_PORT), _HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info("Health-check server listening on port %s", HEALTH_PORT)
+
+
+# ── Instagram URL helpers ──────────────────────────────────────────────────
 INSTAGRAM_URL_RE = re.compile(
     r"https?://(?:www\.)?instagram\.com/"
-    r"(?:p|reel|reels|stories|s)/[\w\-]+/?",
+    r"(?:p|reel|reels|stories|s|tv)/[\w\-]+/?",
     re.IGNORECASE,
 )
-
-
-def extract_shortcode(url: str) -> str | None:
-    """Pull the shortcode from a post / reel URL."""
-    m = re.search(r"/(?:p|reel|reels)/([\w\-]+)", url)
-    return m.group(1) if m else None
-
-
-def extract_story_info(url: str) -> tuple[str, str] | None:
-    """Return (username, story_id) from a stories URL."""
-    m = re.search(r"/stories/([\w\.]+)/(\d+)", url)
-    return (m.group(1), m.group(2)) if m else None
 
 
 def is_instagram_url(text: str) -> bool:
     return bool(INSTAGRAM_URL_RE.search(text))
 
 
-def caption_text(caption: str | None, max_len: int = 1024) -> str:
+def extract_url(text: str) -> str:
+    m = INSTAGRAM_URL_RE.search(text)
+    return m.group(0) if m else ""
+
+
+# ── yt-dlp download ────────────────────────────────────────────────────────
+
+def _build_ydl_opts(tmpdir: str) -> dict:
+    opts = {
+        "outtmpl": os.path.join(tmpdir, "%(playlist_index)s%(id)s.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreerrors": False,
+        "format": "bestvideo+bestaudio/best",
+        "writedescription": True,
+        "writethumbnail": False,
+        "writeinfojson": False,
+        "noplaylist": False,   # allow carousels (playlists)
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        },
+    }
+    if IG_COOKIES_FILE and os.path.isfile(IG_COOKIES_FILE):
+        opts["cookiefile"] = IG_COOKIES_FILE
+        logger.info("Using Instagram cookies from %s", IG_COOKIES_FILE)
+    return opts
+
+
+def _download_sync(url: str, tmpdir: str) -> tuple[list[Path], str]:
+    """Blocking download — called via asyncio.to_thread."""
+    opts = _build_ydl_opts(tmpdir)
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+
+    if info is None:
+        raise RuntimeError("yt-dlp returned no info for this URL.")
+
+    # Grab caption from info dict
+    caption = ""
+    entries = info.get("entries") or [info]
+    for entry in entries:
+        if entry and entry.get("description"):
+            caption = entry["description"].strip()
+            break
+
+    # Fallback: read .description files written by yt-dlp
     if not caption:
-        return ""
+        for desc_file in sorted(Path(tmpdir).glob("*.description")):
+            text = desc_file.read_text(encoding="utf-8", errors="ignore").strip()
+            if text:
+                caption = text
+                break
+
+    # Collect media files (skip .description and other text files)
+    media_exts = {".mp4", ".mov", ".webm", ".mkv", ".jpg", ".jpeg", ".png", ".webp"}
+    media_files: list[Path] = sorted(
+        p for p in Path(tmpdir).iterdir()
+        if p.suffix.lower() in media_exts
+    )
+
+    return media_files, caption
+
+
+async def download_instagram(url: str, tmpdir: str) -> tuple[list[Path], str]:
+    return await asyncio.to_thread(_download_sync, url, tmpdir)
+
+
+# ── Caption helper ─────────────────────────────────────────────────────────
+
+def trim_caption(caption: str, max_len: int = 1024) -> str:
     caption = caption.strip()
     if len(caption) > max_len:
-        caption = caption[: max_len - 3] + "…"
+        caption = caption[: max_len - 1] + "…"
     return caption
 
 
-# ── Download logic ──────────────────────────────────────────────────────────
-
-async def download_post(url: str, tmpdir: str) -> tuple[list[Path], str]:
-    """
-    Download a post or reel.
-    Returns (list_of_media_paths, caption).
-    """
-    shortcode = extract_shortcode(url)
-    if not shortcode:
-        raise ValueError("Could not extract shortcode from URL.")
-
-    post = await asyncio.to_thread(instaloader.Post.from_shortcode, L.context, shortcode)
-    await asyncio.to_thread(L.download_post, post, target=tmpdir)
-
-    # Collect downloaded media
-    media_files: list[Path] = sorted(
-        [
-            p
-            for p in Path(tmpdir).iterdir()
-            if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".mp4", ".mov"}
-        ]
-    )
-    cap = caption_text(post.caption)
-    return media_files, cap
+# ── Send media to Telegram ─────────────────────────────────────────────────
+MAX_GROUP = 10
+VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv"}
 
 
-async def download_story(url: str, tmpdir: str) -> tuple[list[Path], str]:
-    """
-    Download a single story item.
-    Returns (list_of_media_paths, caption).
-    """
-    info = extract_story_info(url)
-    if not info:
-        raise ValueError("Could not parse story URL.")
-
-    username, story_id_str = info
-    story_id = int(story_id_str)
-
-    profile = await asyncio.to_thread(instaloader.Profile.from_username, L.context, username)
-    stories = await asyncio.to_thread(L.get_stories, [profile.userid])
-
-    found_item = None
-    async for story in _async_iter(stories):
-        for item in story.get_items():
-            if item.mediaid == story_id:
-                found_item = item
-                break
-        if found_item:
-            break
-
-    if not found_item:
-        raise ValueError("Story not found — it may have expired or be private.")
-
-    await asyncio.to_thread(L.download_storyitem, found_item, target=tmpdir)
-
-    media_files: list[Path] = sorted(
-        [
-            p
-            for p in Path(tmpdir).iterdir()
-            if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".mp4", ".mov"}
-        ]
-    )
-    return media_files, ""   # stories don't have captions
-
-
-async def _async_iter(sync_iterable):
-    """Wrap a sync iterable for async for."""
-    for item in sync_iterable:
-        yield item
-
-
-# ── Send helpers ────────────────────────────────────────────────────────────
-
-MAX_MEDIA_GROUP = 10   # Telegram limit
-
-
-async def send_media(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    media_files: list[Path],
-    caption: str,
-) -> None:
+async def send_media(update: Update, media_files: list[Path], caption: str) -> None:
     if not media_files:
         await update.message.reply_text("⚠️ No media found in this post.")
         return
+
+    cap = trim_caption(caption) if caption else None
 
     # Single file
     if len(media_files) == 1:
         path = media_files[0]
         with open(path, "rb") as f:
-            if path.suffix.lower() in {".mp4", ".mov"}:
-                await update.message.reply_video(
-                    video=f,
-                    caption=caption or None,
-                    supports_streaming=True,
-                )
+            if path.suffix.lower() in VIDEO_EXTS:
+                await update.message.reply_video(video=f, caption=cap, supports_streaming=True)
             else:
-                await update.message.reply_photo(photo=f, caption=caption or None)
+                await update.message.reply_photo(photo=f, caption=cap)
         return
 
-    # Multiple files → media group(s)
-    chunks = [
-        media_files[i : i + MAX_MEDIA_GROUP]
-        for i in range(0, len(media_files), MAX_MEDIA_GROUP)
-    ]
-    for idx, chunk in enumerate(chunks):
+    # Multiple files → send as media group(s) of up to 10
+    chunks = [media_files[i: i + MAX_GROUP] for i in range(0, len(media_files), MAX_GROUP)]
+    for chunk_idx, chunk in enumerate(chunks):
         media_group = []
-        file_handles = []
-        for i, path in enumerate(chunk):
+        handles = []
+        for item_idx, path in enumerate(chunk):
             fh = open(path, "rb")
-            file_handles.append(fh)
-            cap = (caption if idx == 0 and i == 0 else None) or None
-            if path.suffix.lower() in {".mp4", ".mov"}:
-                media_group.append(InputMediaVideo(media=fh, caption=cap))
+            handles.append(fh)
+            item_cap = cap if (chunk_idx == 0 and item_idx == 0) else None
+            if path.suffix.lower() in VIDEO_EXTS:
+                media_group.append(InputMediaVideo(media=fh, caption=item_cap))
             else:
-                media_group.append(InputMediaPhoto(media=fh, caption=cap))
-
+                media_group.append(InputMediaPhoto(media=fh, caption=item_cap))
         try:
             await update.message.reply_media_group(media=media_group)
         finally:
-            for fh in file_handles:
+            for fh in handles:
                 fh.close()
 
 
-# ── Command & message handlers ──────────────────────────────────────────────
+# ── Telegram handlers ──────────────────────────────────────────────────────
 
-START_MSG = """
-👋 *Welcome to InstaGrab Bot!*
-
-Send me any Instagram link and I'll download it for you:
-
-• 📸 Posts (photos & carousels)
-• 🎬 Reels
-• 📖 Stories
-
-Just paste the URL and hit send!
-"""
+START_MSG = (
+    "👋 *Welcome to InstaGrab Bot!*\n\n"
+    "Send me any Instagram link and I'll download it for you:\n\n"
+    "• 📸 Posts \\(photos & carousels\\)\n"
+    "• 🎬 Reels\n"
+    "• 📺 IGTV\n"
+    "• 📖 Stories\n\n"
+    "Just paste the URL and hit send\\!"
+)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(START_MSG, parse_mode=ParseMode.MARKDOWN)
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(START_MSG, parse_mode=ParseMode.MARKDOWN_V2)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text or ""
+    text = (update.message.text or "").strip()
 
     if not is_instagram_url(text):
         await update.message.reply_text(
-            "🔗 Please send a valid Instagram URL (post, reel, or story)."
+            "🔗 Please send a valid Instagram URL (post, reel, story, or IGTV)."
         )
         return
 
-    url = INSTAGRAM_URL_RE.search(text).group(0)
-    status_msg = await update.message.reply_text("⏳ Downloading… please wait.")
+    url = extract_url(text)
+    status = await update.message.reply_text("⏳ Downloading… please wait.")
 
     tmpdir = tempfile.mkdtemp(prefix="instabot_")
     try:
-        is_story = "/stories/" in url or "/s/" in url
+        media_files, caption = await download_instagram(url, tmpdir)
+        await status.delete()
+        await send_media(update, media_files, caption)
 
-        if is_story:
-            media_files, cap = await download_story(url, tmpdir)
+    except yt_dlp.utils.ExtractorError as exc:
+        msg = str(exc)
+        logger.error("ExtractorError for %s: %s", url, msg)
+        if "login" in msg.lower() or "private" in msg.lower():
+            await status.edit_text(
+                "🔒 This content is private or requires login.\n"
+                "Ask the bot admin to configure Instagram cookies."
+            )
         else:
-            media_files, cap = await download_post(url, tmpdir)
+            await status.edit_text(
+                "❌ Could not extract this post. It may have been deleted or is unavailable."
+            )
 
-        await status_msg.delete()
-        await send_media(update, context, media_files, cap)
+    except yt_dlp.utils.DownloadError as exc:
+        logger.error("DownloadError for %s: %s", url, exc)
+        await status.edit_text(
+            "❌ Download failed. Instagram may be rate-limiting. "
+            "Please try again in a few minutes."
+        )
 
-    except instaloader.exceptions.LoginRequiredException:
-        await status_msg.edit_text(
-            "🔒 This content is private. The bot needs Instagram credentials to access it."
-        )
-    except instaloader.exceptions.BadResponseException as exc:
-        logger.error("Bad response from Instagram: %s", exc)
-        await status_msg.edit_text(
-            "❌ Instagram returned an error. The post may have been deleted or is unavailable."
-        )
-    except ValueError as exc:
-        await status_msg.edit_text(f"❌ {exc}")
-    except Exception as exc:
+    except Exception:
         logger.exception("Unexpected error for URL %s", url)
-        await status_msg.edit_text(
-            "❌ Something went wrong while downloading. Please try again later."
-        )
+        await status.edit_text("❌ Something went wrong. Please try again later.")
+
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -276,8 +253,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    _start_health_server()
+
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot is running…")
