@@ -4,9 +4,8 @@ import logging
 import asyncio
 import tempfile
 import shutil
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from aiohttp import web
 
 from telegram import Update, InputMediaPhoto, InputMediaVideo
 from telegram.ext import (
@@ -16,7 +15,6 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.constants import ParseMode
 import yt_dlp
 
 # ── Logging ────────────────────────────────────────────────────────────────
@@ -29,28 +27,7 @@ logger = logging.getLogger(__name__)
 # ── Config ─────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 HEALTH_PORT = int(os.getenv("PORT", "8000"))
-
-# Optional: path to a Netscape-format cookies file exported from your browser
-# while logged in to Instagram. Set IG_COOKIES_FILE env var on Koyeb.
 IG_COOKIES_FILE = os.getenv("IG_COOKIES_FILE", "")
-
-# ── Tiny HTTP health-check server (Koyeb requires this) ───────────────────
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-    def log_message(self, *_):
-        pass  # suppress access log spam
-
-
-def _start_health_server():
-    server = HTTPServer(("0.0.0.0", HEALTH_PORT), _HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    logger.info("Health-check server listening on port %s", HEALTH_PORT)
-
 
 # ── Instagram URL helpers ──────────────────────────────────────────────────
 INSTAGRAM_URL_RE = re.compile(
@@ -81,7 +58,7 @@ def _build_ydl_opts(tmpdir: str) -> dict:
         "writedescription": True,
         "writethumbnail": False,
         "writeinfojson": False,
-        "noplaylist": False,   # allow carousels (playlists)
+        "noplaylist": False,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -98,23 +75,20 @@ def _build_ydl_opts(tmpdir: str) -> dict:
 
 def _download_sync(url: str, tmpdir: str) -> tuple[list[Path], str]:
     """Blocking download — called via asyncio.to_thread."""
-    opts = _build_ydl_opts(tmpdir)
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    with yt_dlp.YoutubeDL(_build_ydl_opts(tmpdir)) as ydl:
         info = ydl.extract_info(url, download=True)
 
     if info is None:
         raise RuntimeError("yt-dlp returned no info for this URL.")
 
-    # Grab caption from info dict
+    # Grab caption
     caption = ""
-    entries = info.get("entries") or [info]
-    for entry in entries:
+    for entry in (info.get("entries") or [info]):
         if entry and entry.get("description"):
             caption = entry["description"].strip()
             break
 
-    # Fallback: read .description files written by yt-dlp
+    # Fallback: .description files
     if not caption:
         for desc_file in sorted(Path(tmpdir).glob("*.description")):
             text = desc_file.read_text(encoding="utf-8", errors="ignore").strip()
@@ -122,13 +96,11 @@ def _download_sync(url: str, tmpdir: str) -> tuple[list[Path], str]:
                 caption = text
                 break
 
-    # Collect media files (skip .description and other text files)
     media_exts = {".mp4", ".mov", ".webm", ".mkv", ".jpg", ".jpeg", ".png", ".webp"}
-    media_files: list[Path] = sorted(
+    media_files = sorted(
         p for p in Path(tmpdir).iterdir()
         if p.suffix.lower() in media_exts
     )
-
     return media_files, caption
 
 
@@ -140,14 +112,12 @@ async def download_instagram(url: str, tmpdir: str) -> tuple[list[Path], str]:
 
 def trim_caption(caption: str, max_len: int = 1024) -> str:
     caption = caption.strip()
-    if len(caption) > max_len:
-        caption = caption[: max_len - 1] + "…"
-    return caption
+    return caption[: max_len - 1] + "…" if len(caption) > max_len else caption
 
 
-# ── Send media to Telegram ─────────────────────────────────────────────────
-MAX_GROUP = 10
+# ── Send media ─────────────────────────────────────────────────────────────
 VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv"}
+MAX_GROUP = 10
 
 
 async def send_media(update: Update, media_files: list[Path], caption: str) -> None:
@@ -157,7 +127,6 @@ async def send_media(update: Update, media_files: list[Path], caption: str) -> N
 
     cap = trim_caption(caption) if caption else None
 
-    # Single file
     if len(media_files) == 1:
         path = media_files[0]
         with open(path, "rb") as f:
@@ -167,11 +136,9 @@ async def send_media(update: Update, media_files: list[Path], caption: str) -> N
                 await update.message.reply_photo(photo=f, caption=cap)
         return
 
-    # Multiple files → send as media group(s) of up to 10
     chunks = [media_files[i: i + MAX_GROUP] for i in range(0, len(media_files), MAX_GROUP)]
     for chunk_idx, chunk in enumerate(chunks):
-        media_group = []
-        handles = []
+        media_group, handles = [], []
         for item_idx, path in enumerate(chunk):
             fh = open(path, "rb")
             handles.append(fh)
@@ -190,18 +157,18 @@ async def send_media(update: Update, media_files: list[Path], caption: str) -> N
 # ── Telegram handlers ──────────────────────────────────────────────────────
 
 START_MSG = (
-    "👋 *Welcome to InstaGrab Bot!*\n\n"
+    "<b>👋 Welcome to InstaGrab Bot!</b>\n\n"
     "Send me any Instagram link and I'll download it for you:\n\n"
-    "• 📸 Posts \\(photos & carousels\\)\n"
+    "• 📸 Posts (photos &amp; carousels)\n"
     "• 🎬 Reels\n"
     "• 📺 IGTV\n"
     "• 📖 Stories\n\n"
-    "Just paste the URL and hit send\\!"
+    "Just paste the URL and hit send!"
 )
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(START_MSG, parse_mode=ParseMode.MARKDOWN_V2)
+    await update.message.reply_text(START_MSG, parse_mode="HTML")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -250,17 +217,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ── Async health-check server (aiohttp, same event loop as the bot) ────────
+
+async def _health(_request: web.Request) -> web.Response:
+    return web.Response(text="OK")
+
+
+async def _start_health_server():
+    app = web.Application()
+    app.router.add_get("/", _health)
+    app.router.add_get("/health", _health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", HEALTH_PORT)
+    await site.start()
+    logger.info("Health-check server listening on port %s", HEALTH_PORT)
+
+
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    _start_health_server()
-
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    # Start the health-check server inside the bot's own event loop
+    # post_init runs after the event loop is started but before polling begins
+    async def post_init(application: Application) -> None:
+        await _start_health_server()
+
+    app.post_init = post_init
+
     logger.info("Bot is running…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
