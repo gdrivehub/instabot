@@ -33,3 +33,6 @@ instabot_*/
 .vscode/
 *.swp
 *.swo
+-e 
+# Instagram cookies — never commit
+cookies.txt
