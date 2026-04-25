@@ -1,11 +1,12 @@
 import os
 import re
-import time
-import random
+import json
 import logging
 import asyncio
 import tempfile
 import shutil
+import time
+import random
 from pathlib import Path
 from aiohttp import web
 
@@ -16,9 +17,17 @@ from telegram.ext import (
     MessageHandler,
     filters,
     ContextTypes,
-    ConversationHandler,
 )
-import yt_dlp
+from instagrapi import Client
+from instagrapi.exceptions import (
+    LoginRequired,
+    ChallengeRequired,
+    BadPassword,
+    UserNotFound,
+    MediaNotFound,
+    PrivateError,
+    RateLimitError,
+)
 
 # ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -28,32 +37,73 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-HEALTH_PORT = int(os.getenv("PORT", "8000"))
-IG_COOKIES_FILE = os.getenv("IG_COOKIES_FILE", "")
+BOT_TOKEN       = os.environ["BOT_TOKEN"]
+HEALTH_PORT     = int(os.getenv("PORT", "8000"))
+IG_USERNAME     = os.getenv("IG_USERNAME", "")
+IG_PASSWORD     = os.getenv("IG_PASSWORD", "")
+SESSION_FILE    = os.getenv("SESSION_FILE", "/tmp/ig_session.json")
 
-# Write cookies from env var to disk at startup (for Koyeb)
-_IG_COOKIES_CONTENT = os.getenv("IG_COOKIES_CONTENT", "")
-if _IG_COOKIES_CONTENT and not IG_COOKIES_FILE:
-    _cookie_path = "/tmp/cookies.txt"
-    with open(_cookie_path, "w") as _f:
-        _f.write(_IG_COOKIES_CONTENT)
-    IG_COOKIES_FILE = _cookie_path
-    logger.info("Cookies written to %s", _cookie_path)
+# ── Instagram client (singleton) ───────────────────────────────────────────
+_cl: Client | None = None
+_cl_lock = asyncio.Lock()
+_last_request_time: float = 0.0
 
-# ── Proxy state ────────────────────────────────────────────────────────────
-# In-memory proxy list — loaded at runtime via /proxy command
-_proxies: list[str] = []
+MIN_DELAY = 3.0   # seconds between Instagram requests
 
-# Conversation state for /proxy file upload
-WAITING_FOR_PROXY_FILE = 1
 
-MIN_DELAY = float(os.getenv("MIN_DELAY", "4"))
-MAX_DELAY = float(os.getenv("MAX_DELAY", "8"))
-_last_download_time: float = 0.0
-_download_lock = asyncio.Lock()
+def _build_client() -> Client:
+    cl = Client()
+    cl.delay_range = [2, 5]   # instagrapi built-in random delay between requests
+    return cl
 
-# ── Instagram URL helpers ──────────────────────────────────────────────────
+
+def _load_session(cl: Client) -> bool:
+    """Try to load an existing session from disk. Returns True if successful."""
+    if os.path.isfile(SESSION_FILE):
+        try:
+            cl.load_settings(SESSION_FILE)
+            cl.login(IG_USERNAME, IG_PASSWORD)   # re-auth with saved session
+            logger.info("Session loaded from %s", SESSION_FILE)
+            return True
+        except Exception as exc:
+            logger.warning("Could not reuse saved session: %s", exc)
+    return False
+
+
+def _fresh_login(cl: Client) -> None:
+    """Perform a fresh login and save the session."""
+    cl.login(IG_USERNAME, IG_PASSWORD)
+    cl.dump_settings(SESSION_FILE)
+    logger.info("Fresh login successful — session saved to %s", SESSION_FILE)
+
+
+def _get_client() -> Client:
+    """Return the logged-in singleton client (sync, call from thread)."""
+    global _cl
+    if _cl is not None:
+        return _cl
+    cl = _build_client()
+    if not _load_session(cl):
+        _fresh_login(cl)
+    _cl = cl
+    return _cl
+
+
+async def get_client() -> Client:
+    async with _cl_lock:
+        return await asyncio.to_thread(_get_client)
+
+
+def _relogin(cl: Client) -> None:
+    """Force a fresh login (e.g. after session expiry)."""
+    global _cl
+    logger.info("Session expired — re-logging in")
+    cl2 = _build_client()
+    _fresh_login(cl2)
+    _cl = cl2
+
+
+# ── URL parsing ────────────────────────────────────────────────────────────
 INSTAGRAM_URL_RE = re.compile(
     r"https?://(?:www\.)?instagram\.com/"
     r"(?:p|reel|reels|stories|s|tv)/[\w\-]+/?",
@@ -70,112 +120,105 @@ def extract_url(text: str) -> str:
     return m.group(0) if m else ""
 
 
-# ── Proxy helpers ──────────────────────────────────────────────────────────
-
-def _parse_proxy_file(content: str) -> list[str]:
-    """Parse proxy list from file content. One proxy per line."""
-    proxies = []
-    for line in content.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        # Auto-prefix with http:// if no scheme given
-        if not re.match(r"^(http|https|socks4|socks5)://", line, re.IGNORECASE):
-            line = "http://" + line
-        proxies.append(line)
-    return proxies
+def extract_shortcode(url: str) -> str | None:
+    m = re.search(r"/(?:p|reel|reels|tv)/([\w\-]+)", url)
+    return m.group(1) if m else None
 
 
-def _get_random_proxy() -> str | None:
-    """Return a random proxy from the loaded list, or None if empty."""
-    return random.choice(_proxies) if _proxies else None
+def extract_story_info(url: str) -> tuple[str, int] | None:
+    m = re.search(r"/stories/([\w\.]+)/(\d+)", url)
+    return (m.group(1), int(m.group(2))) if m else None
 
 
-# ── yt-dlp options ─────────────────────────────────────────────────────────
+# ── Download logic ─────────────────────────────────────────────────────────
 
-_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-]
-
-
-def _build_ydl_opts(tmpdir: str, proxy: str | None = None) -> dict:
-    opts = {
-        "outtmpl": os.path.join(tmpdir, "%(playlist_index)s%(id)s.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-        "ignoreerrors": False,
-        "format": "bestvideo+bestaudio/best",
-        "writedescription": True,
-        "writethumbnail": False,
-        "writeinfojson": False,
-        "noplaylist": False,
-        "retries": 3,
-        "fragment_retries": 3,
-        "retry_sleep_functions": {"http": lambda n: 2 ** n},
-        "socket_timeout": 30,
-        "http_headers": {
-            "User-Agent": random.choice(_USER_AGENTS),
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Sec-Fetch-Mode": "navigate",
-        },
-    }
-    if IG_COOKIES_FILE and os.path.isfile(IG_COOKIES_FILE):
-        opts["cookiefile"] = IG_COOKIES_FILE
-    if proxy:
-        opts["proxy"] = proxy
-        logger.info("Using proxy: %s", proxy)
-    return opts
+def _throttle():
+    """Block until MIN_DELAY seconds have passed since last request."""
+    global _last_request_time
+    elapsed = time.monotonic() - _last_request_time
+    wait = max(0.0, MIN_DELAY + random.uniform(0, 2) - elapsed)
+    if wait > 0:
+        time.sleep(wait)
+    _last_request_time = time.monotonic()
 
 
-def _download_sync(url: str, tmpdir: str, proxy: str | None) -> tuple[list[Path], str]:
-    """Blocking yt-dlp download. Run via asyncio.to_thread."""
-    with yt_dlp.YoutubeDL(_build_ydl_opts(tmpdir, proxy)) as ydl:
-        info = ydl.extract_info(url, download=True)
+def _download_post_sync(url: str, tmpdir: str) -> tuple[list[Path], str]:
+    """Download a post/reel. Returns (media_paths, caption)."""
+    cl = _get_client()
+    shortcode = extract_shortcode(url)
+    if not shortcode:
+        raise ValueError("Could not extract shortcode from URL.")
 
-    if info is None:
-        raise RuntimeError("yt-dlp returned no info for this URL.")
+    _throttle()
+    media = cl.media_info_by_url(url) if hasattr(cl, 'media_info_by_url') else cl.media_info(cl.media_pk_from_code(shortcode))
+    caption = media.caption_text or ""
 
-    caption = ""
-    for entry in (info.get("entries") or [info]):
-        if entry and entry.get("description"):
-            caption = entry["description"].strip()
-            break
+    tmppath = Path(tmpdir)
+    paths: list[Path] = []
 
-    if not caption:
-        for desc_file in sorted(Path(tmpdir).glob("*.description")):
-            text = desc_file.read_text(encoding="utf-8", errors="ignore").strip()
-            if text:
-                caption = text
-                break
+    # Carousel (multiple items)
+    if media.media_type == 8 and media.resources:
+        for i, resource in enumerate(media.resources):
+            if resource.media_type == 1:   # photo
+                p = cl.photo_download(resource.pk, folder=tmpdir)
+            else:                           # video
+                p = cl.video_download(resource.pk, folder=tmpdir)
+            if p:
+                paths.append(Path(p))
+    elif media.media_type == 1:   # single photo
+        p = cl.photo_download(media.pk, folder=tmpdir)
+        if p:
+            paths.append(Path(p))
+    elif media.media_type == 2:   # video / reel
+        p = cl.video_download(media.pk, folder=tmpdir)
+        if p:
+            paths.append(Path(p))
+    else:
+        raise ValueError(f"Unsupported media type: {media.media_type}")
 
-    media_exts = {".mp4", ".mov", ".webm", ".mkv", ".jpg", ".jpeg", ".png", ".webp"}
-    media_files = sorted(
-        p for p in Path(tmpdir).iterdir()
-        if p.suffix.lower() in media_exts
-    )
-    return media_files, caption
+    return sorted(paths), caption
+
+
+def _download_story_sync(url: str, tmpdir: str) -> tuple[list[Path], str]:
+    """Download a single story item. Returns (media_paths, caption)."""
+    cl = _get_client()
+    info = extract_story_info(url)
+    if not info:
+        raise ValueError("Could not parse story URL.")
+
+    username, story_pk = info
+    _throttle()
+
+    user_id = cl.user_id_from_username(username)
+    stories = cl.user_stories(user_id)
+    item = next((s for s in stories if s.pk == story_pk), None)
+
+    if not item:
+        raise MediaNotFound("Story not found — it may have expired.")
+
+    if item.media_type == 1:
+        p = cl.photo_download_by_url(str(item.thumbnail_url), filename=str(item.pk), folder=tmpdir)
+    else:
+        p = cl.video_download_by_url(str(item.video_url), filename=str(item.pk), folder=tmpdir)
+
+    return ([Path(p)] if p else []), ""
 
 
 async def download_instagram(url: str, tmpdir: str) -> tuple[list[Path], str]:
-    global _last_download_time
+    global _cl
 
-    async with _download_lock:
-        elapsed = time.monotonic() - _last_download_time
-        delay = random.uniform(MIN_DELAY, MAX_DELAY)
-        wait = max(0.0, delay - elapsed)
-        if wait > 0:
-            logger.info("Waiting %.1fs before download (rate-limit protection)", wait)
-            await asyncio.sleep(wait)
+    is_story = "/stories/" in url or "/s/" in url
+    fn = _download_story_sync if is_story else _download_post_sync
 
-        proxy = _get_random_proxy()
-        result = await asyncio.to_thread(_download_sync, url, tmpdir, proxy)
-        _last_download_time = time.monotonic()
-        return result
+    try:
+        return await asyncio.to_thread(fn, url, tmpdir)
+
+    except (LoginRequired, ChallengeRequired):
+        logger.warning("Session expired — attempting re-login")
+        async with _cl_lock:
+            await asyncio.to_thread(_relogin, _cl or _build_client())
+        # Retry once after re-login
+        return await asyncio.to_thread(fn, url, tmpdir)
 
 
 # ── Caption helper ─────────────────────────────────────────────────────────
@@ -192,7 +235,7 @@ MAX_GROUP = 10
 
 async def send_media(update: Update, media_files: list[Path], caption: str) -> None:
     if not media_files:
-        await update.message.reply_text("⚠️ No media found in this post.")
+        await update.message.reply_text("⚠️ No media found.")
         return
 
     cap = trim_caption(caption) if caption else None
@@ -224,110 +267,7 @@ async def send_media(update: Update, media_files: list[Path], caption: str) -> N
                 fh.close()
 
 
-# ── /proxy conversation handler ────────────────────────────────────────────
-
-async def cmd_proxy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Entry point for /proxy — ask user to send the file."""
-    proxy_status = (
-        f"✅ <b>{len(_proxies)} proxies</b> currently loaded."
-        if _proxies
-        else "⚠️ No proxies loaded yet."
-    )
-    await update.message.reply_text(
-        f"{proxy_status}\n\n"
-        "📄 Send me a <b>.txt file</b> with one proxy per line to load/replace them.\n\n"
-        "<b>Supported formats:</b>\n"
-        "<code>ip:port</code>\n"
-        "<code>http://ip:port</code>\n"
-        "<code>http://user:pass@ip:port</code>\n"
-        "<code>socks5://ip:port</code>\n\n"
-        "Lines starting with <code>#</code> are treated as comments.\n\n"
-        "Send /cancel to abort.",
-        parse_mode="HTML",
-    )
-    return WAITING_FOR_PROXY_FILE
-
-
-async def receive_proxy_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive the .txt file and load proxies from it."""
-    global _proxies
-
-    doc = update.message.document
-    if not doc:
-        await update.message.reply_text("❌ Please send a .txt file, not a message.")
-        return WAITING_FOR_PROXY_FILE
-
-    if not doc.file_name.lower().endswith(".txt"):
-        await update.message.reply_text(
-            "❌ File must be a <b>.txt</b> file. Please try again or /cancel.",
-            parse_mode="HTML",
-        )
-        return WAITING_FOR_PROXY_FILE
-
-    # Download file content
-    status = await update.message.reply_text("⏳ Loading proxies…")
-    try:
-        tg_file = await context.bot.get_file(doc.file_id)
-        content_bytes = await tg_file.download_as_bytearray()
-        content = content_bytes.decode("utf-8", errors="ignore")
-    except Exception as exc:
-        logger.exception("Failed to download proxy file")
-        await status.edit_text(f"❌ Could not read the file: {exc}")
-        return ConversationHandler.END
-
-    parsed = _parse_proxy_file(content)
-
-    if not parsed:
-        await status.edit_text(
-            "❌ No valid proxies found in the file.\n"
-            "Make sure each line contains a proxy in <code>ip:port</code> or full URL format.",
-            parse_mode="HTML",
-        )
-        return WAITING_FOR_PROXY_FILE
-
-    _proxies = parsed
-    logger.info("Loaded %d proxies from uploaded file", len(_proxies))
-
-    # Show a preview of loaded proxies (first 5)
-    preview = "\n".join(f"• <code>{p}</code>" for p in _proxies[:5])
-    more = f"\n<i>…and {len(_proxies) - 5} more</i>" if len(_proxies) > 5 else ""
-
-    await status.edit_text(
-        f"✅ <b>{len(_proxies)} proxies loaded successfully!</b>\n\n"
-        f"{preview}{more}\n\n"
-        "Proxies will be picked randomly for each download.",
-        parse_mode="HTML",
-    )
-    return ConversationHandler.END
-
-
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("❌ Cancelled.")
-    return ConversationHandler.END
-
-
-async def cmd_proxystatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show current proxy list."""
-    if not _proxies:
-        await update.message.reply_text("⚠️ No proxies loaded. Use /proxy to upload a list.")
-        return
-
-    preview = "\n".join(f"• <code>{p}</code>" for p in _proxies[:10])
-    more = f"\n<i>…and {len(_proxies) - 10} more</i>" if len(_proxies) > 10 else ""
-    await update.message.reply_text(
-        f"🌐 <b>{len(_proxies)} proxies loaded:</b>\n\n{preview}{more}",
-        parse_mode="HTML",
-    )
-
-
-async def cmd_clearproxy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Clear all proxies."""
-    global _proxies
-    _proxies = []
-    await update.message.reply_text("🗑️ All proxies cleared. Bot will use direct connection.")
-
-
-# ── /start ─────────────────────────────────────────────────────────────────
+# ── Handlers ───────────────────────────────────────────────────────────────
 
 START_MSG = (
     "<b>👋 Welcome to InstaGrab Bot!</b>\n\n"
@@ -336,19 +276,13 @@ START_MSG = (
     "• 🎬 Reels\n"
     "• 📺 IGTV\n"
     "• 📖 Stories\n\n"
-    "<b>Commands:</b>\n"
-    "/proxy — Upload a proxy list (.txt file)\n"
-    "/proxystatus — View loaded proxies\n"
-    "/clearproxy — Remove all proxies\n\n"
-    "Just paste an Instagram URL to download!"
+    "Just paste the URL and hit send!"
 )
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(START_MSG, parse_mode="HTML")
 
-
-# ── URL message handler ────────────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
@@ -360,16 +294,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     url = extract_url(text)
-
-    proxy_info = f" via proxy" if _proxies else ""
-    elapsed = time.monotonic() - _last_download_time
-    wait_est = max(0.0, MIN_DELAY - elapsed)
-    if wait_est > 1:
-        status = await update.message.reply_text(
-            f"⏳ Downloading{proxy_info}… (~{int(wait_est)+1}s delay for rate-limit protection)"
-        )
-    else:
-        status = await update.message.reply_text(f"⏳ Downloading{proxy_info}… please wait.")
+    status = await update.message.reply_text("⏳ Downloading… please wait.")
 
     tmpdir = tempfile.mkdtemp(prefix="instabot_")
     try:
@@ -377,44 +302,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await status.delete()
         await send_media(update, media_files, caption)
 
-    except yt_dlp.utils.ExtractorError as exc:
-        msg = str(exc)
-        logger.error("ExtractorError for %s: %s", url, msg)
-        if "login" in msg.lower() or "private" in msg.lower() or "rate" in msg.lower():
-            await status.edit_text(
-                "🔒 Instagram blocked this request.\n\n"
-                "Try:\n"
-                "• Uploading fresh proxies with /proxy\n"
-                "• Updating your cookies in Koyeb env vars\n"
-                "• Waiting a few minutes and retrying",
-                parse_mode="HTML",
-            )
-        else:
-            await status.edit_text("❌ Could not extract this post. It may be deleted or private.")
+    except PrivateError:
+        await status.edit_text("🔒 This content is private — the bot account must follow this user.")
 
-    except yt_dlp.utils.DownloadError as exc:
-        msg = str(exc)
-        logger.error("DownloadError for %s: %s", url, msg)
-        if "rate" in msg.lower() or "login" in msg.lower() or "not available" in msg.lower():
-            await status.edit_text(
-                "⚠️ <b>Instagram rate-limit hit.</b>\n\n"
-                "Try uploading proxies with /proxy or wait a few minutes.",
-                parse_mode="HTML",
-            )
-        else:
-            await status.edit_text("❌ Download failed. Please try again in a few minutes.")
+    except MediaNotFound:
+        await status.edit_text("❌ Post not found — it may have been deleted or the URL is invalid.")
+
+    except RateLimitError:
+        await status.edit_text(
+            "⚠️ Instagram rate-limit hit. Please wait a few minutes and try again."
+        )
+
+    except (LoginRequired, ChallengeRequired, BadPassword) as exc:
+        logger.error("Auth error: %s", exc)
+        await status.edit_text(
+            "🔒 Instagram login failed or requires verification.\n"
+            "Check that <code>IG_USERNAME</code> and <code>IG_PASSWORD</code> are correct in Koyeb.",
+            parse_mode="HTML",
+        )
+
+    except ValueError as exc:
+        await status.edit_text(f"❌ {exc}")
 
     except Exception:
-        logger.exception("Unexpected error for URL %s", url)
+        logger.exception("Unexpected error for %s", url)
         await status.edit_text("❌ Something went wrong. Please try again later.")
 
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ── Health check server ────────────────────────────────────────────────────
+# ── Health check ───────────────────────────────────────────────────────────
 
-async def _health(_request: web.Request) -> web.Response:
+async def _health(_: web.Request) -> web.Response:
     return web.Response(text="OK")
 
 
@@ -424,43 +344,32 @@ async def _start_health_server() -> None:
     app.router.add_get("/health", _health)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", HEALTH_PORT)
-    await site.start()
+    await web.TCPSite(runner, "0.0.0.0", HEALTH_PORT).start()
     logger.info("Health-check server on port %s", HEALTH_PORT)
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    if not IG_USERNAME or not IG_PASSWORD:
+        raise RuntimeError("IG_USERNAME and IG_PASSWORD environment variables must be set.")
+
     app = Application.builder().token(BOT_TOKEN).build()
-
-    # /proxy conversation: command → wait for file → done
-    proxy_conv = ConversationHandler(
-        entry_points=[CommandHandler("proxy", cmd_proxy)],
-        states={
-            WAITING_FOR_PROXY_FILE: [
-                MessageHandler(filters.Document.TXT, receive_proxy_file),
-                CommandHandler("cancel", cmd_cancel),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-        allow_reentry=True,
-    )
-
-    app.add_handler(proxy_conv)
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("proxystatus", cmd_proxystatus))
-    app.add_handler(CommandHandler("clearproxy", cmd_clearproxy))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     async def post_init(application: Application) -> None:
         await _start_health_server()
-        # Register commands in Telegram menu
+        # Pre-login at startup so first request is instant
+        logger.info("Logging in to Instagram as %s…", IG_USERNAME)
+        try:
+            await get_client()
+            logger.info("Instagram login OK ✅")
+        except Exception as exc:
+            logger.error("Instagram login FAILED: %s — bot will retry on first request", exc)
+
         await application.bot.set_my_commands([
             ("start", "Welcome message & instructions"),
-            ("proxy", "Upload a proxy list (.txt file)"),
-            ("proxystatus", "View currently loaded proxies"),
-            ("clearproxy", "Remove all proxies"),
         ])
 
     app.post_init = post_init
