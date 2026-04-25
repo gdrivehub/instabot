@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
 
-RUN useradd -m botuser
+RUN useradd -m botuser && mkdir -p /tmp && chown botuser /tmp
 USER botuser
 
 EXPOSE 8000
