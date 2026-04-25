@@ -23,7 +23,6 @@ from instagrapi.exceptions import (
     LoginRequired,
     ChallengeRequired,
     BadPassword,
-    UserNotFound,
     MediaNotFound,
     PrivateError,
     RateLimitError,
@@ -37,70 +36,79 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────
-BOT_TOKEN       = os.environ["BOT_TOKEN"]
-HEALTH_PORT     = int(os.getenv("PORT", "8000"))
-IG_USERNAME     = os.getenv("IG_USERNAME", "")
-IG_PASSWORD     = os.getenv("IG_PASSWORD", "")
-SESSION_FILE    = os.getenv("SESSION_FILE", "/tmp/ig_session.json")
+BOT_TOKEN        = os.environ["BOT_TOKEN"]
+HEALTH_PORT      = int(os.getenv("PORT", "8000"))
+SESSION_FILE     = "/tmp/ig_session.json"
 
-# ── Instagram client (singleton) ───────────────────────────────────────────
+# IG_SESSION_JSON env var holds the full contents of session.json
+IG_SESSION_JSON  = os.getenv("IG_SESSION_JSON", "")
+
+# Optional fallback: plain sessionid cookie value
+IG_SESSION_ID    = os.getenv("IG_SESSION_ID", "")
+IG_USERNAME      = os.getenv("IG_USERNAME", "")
+
+# ── Write session to disk at startup ──────────────────────────────────────
+if IG_SESSION_JSON:
+    try:
+        # Validate it's proper JSON before writing
+        parsed = json.loads(IG_SESSION_JSON)
+        with open(SESSION_FILE, "w") as f:
+            json.dump(parsed, f)
+        logger.info("Session JSON written to %s", SESSION_FILE)
+    except json.JSONDecodeError as e:
+        logger.error("IG_SESSION_JSON is not valid JSON: %s", e)
+        raise RuntimeError("IG_SESSION_JSON env var contains invalid JSON. Check the value in Koyeb.") from e
+
+# ── Instagram client ───────────────────────────────────────────────────────
 _cl: Client | None = None
 _cl_lock = asyncio.Lock()
 _last_request_time: float = 0.0
-
-MIN_DELAY = 3.0   # seconds between Instagram requests
+MIN_DELAY = 3.0
 
 
 def _build_client() -> Client:
     cl = Client()
-    cl.delay_range = [2, 5]   # instagrapi built-in random delay between requests
+    cl.delay_range = [2, 5]
     return cl
 
 
-def _load_session(cl: Client) -> bool:
-    """Try to load an existing session from disk. Returns True if successful."""
+def _init_client_sync() -> Client:
+    """Load session from file or sessionid. Raises on failure."""
+    cl = _build_client()
+
     if os.path.isfile(SESSION_FILE):
         try:
             cl.load_settings(SESSION_FILE)
-            cl.login(IG_USERNAME, IG_PASSWORD)   # re-auth with saved session
-            logger.info("Session loaded from %s", SESSION_FILE)
-            return True
+            # Verify session is still alive with a lightweight call
+            cl.get_timeline_feed()
+            logger.info("Instagram session loaded and verified ✅")
+            return cl
         except Exception as exc:
-            logger.warning("Could not reuse saved session: %s", exc)
-    return False
+            logger.warning("Saved session invalid or expired: %s", exc)
 
+    # Fallback: plain sessionid cookie
+    if IG_SESSION_ID:
+        try:
+            cl2 = _build_client()
+            cl2.login_by_sessionid(IG_SESSION_ID)
+            cl2.dump_settings(SESSION_FILE)
+            logger.info("Logged in via sessionid cookie ✅")
+            return cl2
+        except Exception as exc:
+            logger.error("sessionid login failed: %s", exc)
 
-def _fresh_login(cl: Client) -> None:
-    """Perform a fresh login and save the session."""
-    cl.login(IG_USERNAME, IG_PASSWORD)
-    cl.dump_settings(SESSION_FILE)
-    logger.info("Fresh login successful — session saved to %s", SESSION_FILE)
-
-
-def _get_client() -> Client:
-    """Return the logged-in singleton client (sync, call from thread)."""
-    global _cl
-    if _cl is not None:
-        return _cl
-    cl = _build_client()
-    if not _load_session(cl):
-        _fresh_login(cl)
-    _cl = cl
-    return _cl
+    raise RuntimeError(
+        "Could not authenticate with Instagram.\n"
+        "Make sure IG_SESSION_JSON (or IG_SESSION_ID) is set correctly in Koyeb env vars."
+    )
 
 
 async def get_client() -> Client:
-    async with _cl_lock:
-        return await asyncio.to_thread(_get_client)
-
-
-def _relogin(cl: Client) -> None:
-    """Force a fresh login (e.g. after session expiry)."""
     global _cl
-    logger.info("Session expired — re-logging in")
-    cl2 = _build_client()
-    _fresh_login(cl2)
-    _cl = cl2
+    async with _cl_lock:
+        if _cl is None:
+            _cl = await asyncio.to_thread(_init_client_sync)
+        return _cl
 
 
 # ── URL parsing ────────────────────────────────────────────────────────────
@@ -130,10 +138,9 @@ def extract_story_info(url: str) -> tuple[str, int] | None:
     return (m.group(1), int(m.group(2))) if m else None
 
 
-# ── Download logic ─────────────────────────────────────────────────────────
+# ── Throttle ───────────────────────────────────────────────────────────────
 
 def _throttle():
-    """Block until MIN_DELAY seconds have passed since last request."""
     global _last_request_time
     elapsed = time.monotonic() - _last_request_time
     wait = max(0.0, MIN_DELAY + random.uniform(0, 2) - elapsed)
@@ -142,34 +149,36 @@ def _throttle():
     _last_request_time = time.monotonic()
 
 
-def _download_post_sync(url: str, tmpdir: str) -> tuple[list[Path], str]:
-    """Download a post/reel. Returns (media_paths, caption)."""
-    cl = _get_client()
+# ── Download logic ─────────────────────────────────────────────────────────
+
+def _download_post_sync(cl: Client, url: str, tmpdir: str) -> tuple[list[Path], str]:
     shortcode = extract_shortcode(url)
     if not shortcode:
         raise ValueError("Could not extract shortcode from URL.")
 
     _throttle()
-    media = cl.media_info_by_url(url) if hasattr(cl, 'media_info_by_url') else cl.media_info(cl.media_pk_from_code(shortcode))
+    pk = cl.media_pk_from_code(shortcode)
+    media = cl.media_info(pk)
     caption = media.caption_text or ""
 
-    tmppath = Path(tmpdir)
     paths: list[Path] = []
 
-    # Carousel (multiple items)
     if media.media_type == 8 and media.resources:
-        for i, resource in enumerate(media.resources):
-            if resource.media_type == 1:   # photo
+        # Carousel
+        for resource in media.resources:
+            if resource.media_type == 1:
                 p = cl.photo_download(resource.pk, folder=tmpdir)
-            else:                           # video
+            else:
                 p = cl.video_download(resource.pk, folder=tmpdir)
             if p:
                 paths.append(Path(p))
-    elif media.media_type == 1:   # single photo
+    elif media.media_type == 1:
+        # Single photo
         p = cl.photo_download(media.pk, folder=tmpdir)
         if p:
             paths.append(Path(p))
-    elif media.media_type == 2:   # video / reel
+    elif media.media_type == 2:
+        # Video / Reel
         p = cl.video_download(media.pk, folder=tmpdir)
         if p:
             paths.append(Path(p))
@@ -179,9 +188,7 @@ def _download_post_sync(url: str, tmpdir: str) -> tuple[list[Path], str]:
     return sorted(paths), caption
 
 
-def _download_story_sync(url: str, tmpdir: str) -> tuple[list[Path], str]:
-    """Download a single story item. Returns (media_paths, caption)."""
-    cl = _get_client()
+def _download_story_sync(cl: Client, url: str, tmpdir: str) -> tuple[list[Path], str]:
     info = extract_story_info(url)
     if not info:
         raise ValueError("Could not parse story URL.")
@@ -206,29 +213,28 @@ def _download_story_sync(url: str, tmpdir: str) -> tuple[list[Path], str]:
 
 async def download_instagram(url: str, tmpdir: str) -> tuple[list[Path], str]:
     global _cl
-
+    cl = await get_client()
     is_story = "/stories/" in url or "/s/" in url
     fn = _download_story_sync if is_story else _download_post_sync
 
     try:
-        return await asyncio.to_thread(fn, url, tmpdir)
-
+        return await asyncio.to_thread(fn, cl, url, tmpdir)
     except (LoginRequired, ChallengeRequired):
-        logger.warning("Session expired — attempting re-login")
+        # Session expired mid-run — try reloading from env
+        logger.warning("Session expired mid-run — reinitialising client")
         async with _cl_lock:
-            await asyncio.to_thread(_relogin, _cl or _build_client())
-        # Retry once after re-login
-        return await asyncio.to_thread(fn, url, tmpdir)
+            _cl = None
+        cl = await get_client()
+        return await asyncio.to_thread(fn, cl, url, tmpdir)
 
 
-# ── Caption helper ─────────────────────────────────────────────────────────
+# ── Caption / media helpers ────────────────────────────────────────────────
 
 def trim_caption(caption: str, max_len: int = 1024) -> str:
     caption = caption.strip()
     return caption[: max_len - 1] + "…" if len(caption) > max_len else caption
 
 
-# ── Send media ─────────────────────────────────────────────────────────────
 VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv"}
 MAX_GROUP = 10
 
@@ -267,7 +273,7 @@ async def send_media(update: Update, media_files: list[Path], caption: str) -> N
                 fh.close()
 
 
-# ── Handlers ───────────────────────────────────────────────────────────────
+# ── Telegram handlers ──────────────────────────────────────────────────────
 
 START_MSG = (
     "<b>👋 Welcome to InstaGrab Bot!</b>\n\n"
@@ -303,31 +309,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await send_media(update, media_files, caption)
 
     except PrivateError:
-        await status.edit_text("🔒 This content is private — the bot account must follow this user.")
-
+        await status.edit_text(
+            "🔒 This content is private.\n"
+            "The bot's Instagram account needs to follow this user to download their content."
+        )
     except MediaNotFound:
-        await status.edit_text("❌ Post not found — it may have been deleted or the URL is invalid.")
-
+        await status.edit_text(
+            "❌ Post not found — it may have been deleted or the URL is invalid."
+        )
     except RateLimitError:
         await status.edit_text(
             "⚠️ Instagram rate-limit hit. Please wait a few minutes and try again."
         )
-
     except (LoginRequired, ChallengeRequired, BadPassword) as exc:
         logger.error("Auth error: %s", exc)
         await status.edit_text(
-            "🔒 Instagram login failed or requires verification.\n"
-            "Check that <code>IG_USERNAME</code> and <code>IG_PASSWORD</code> are correct in Koyeb.",
+            "🔒 Instagram session expired or requires verification.\n\n"
+            "Generate a new <code>session.json</code> from your PC and update "
+            "<code>IG_SESSION_JSON</code> in Koyeb env vars.",
             parse_mode="HTML",
         )
-
     except ValueError as exc:
         await status.edit_text(f"❌ {exc}")
-
     except Exception:
         logger.exception("Unexpected error for %s", url)
         await status.edit_text("❌ Something went wrong. Please try again later.")
-
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -351,8 +357,12 @@ async def _start_health_server() -> None:
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    if not IG_USERNAME or not IG_PASSWORD:
-        raise RuntimeError("IG_USERNAME and IG_PASSWORD environment variables must be set.")
+    if not IG_SESSION_JSON and not IG_SESSION_ID:
+        raise RuntimeError(
+            "No Instagram session configured.\n"
+            "Set IG_SESSION_JSON (contents of session.json) "
+            "or IG_SESSION_ID (sessionid cookie value) in Koyeb env vars."
+        )
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -360,13 +370,13 @@ def main() -> None:
 
     async def post_init(application: Application) -> None:
         await _start_health_server()
-        # Pre-login at startup so first request is instant
-        logger.info("Logging in to Instagram as %s…", IG_USERNAME)
+        logger.info("Verifying Instagram session…")
         try:
             await get_client()
-            logger.info("Instagram login OK ✅")
+            logger.info("Instagram session OK ✅")
         except Exception as exc:
-            logger.error("Instagram login FAILED: %s — bot will retry on first request", exc)
+            logger.error("Instagram session failed: %s", exc)
+            raise
 
         await application.bot.set_my_commands([
             ("start", "Welcome message & instructions"),
